@@ -283,8 +283,10 @@ fn pyc_source_path(path: &Utf8Path) -> Option<Utf8PathBuf> {
     if pycache.file_name() != Some(PYCACHE_DIR) {
         return None;
     }
-    // The format is `<module>.<tag>[.opt-N]` and module names can't contain dots
-    let module = filename.split('.').next()?;
+    // The format is `<module>.<tag>[.opt-N]`. Strip from the right since
+    // module filenames can contain dots (even if they aren't importable)
+    let filename = filename.rsplit_once(".opt-").map_or(filename, |(f, _)| f);
+    let (module, _tag) = filename.rsplit_once('.')?;
     if module.is_empty() {
         return None;
     }
@@ -494,6 +496,11 @@ mod tests {
         assert_eq!(
             p("/site-packages/foo/__pycache__/bar.cpython-312.opt-1.pyc"),
             Some(Utf8PathBuf::from("/site-packages/foo/bar.py"))
+        );
+        // dotted module filename
+        assert_eq!(
+            p("/site-packages/foo/__pycache__/bar.v2.cpython-312.opt-2.pyc"),
+            Some(Utf8PathBuf::from("/site-packages/foo/bar.v2.py"))
         );
         // not in __pycache__
         assert_eq!(p("/site-packages/foo/bar.pyc"), None);
