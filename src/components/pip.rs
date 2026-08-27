@@ -47,6 +47,9 @@ const DEFAULT_UPDATE_INTERVAL_DAYS: u64 = 30;
 ///
 /// Distributions with the same normalized name found in multiple locations
 /// (e.g. multiple Python versions or venvs) are merged into one component.
+/// Distributions vendored inside another distribution (their dist-info is
+/// listed in the outer RECORD, e.g. `setuptools/_vendor`, see
+/// <https://github.com/pypa/setuptools/issues/2825>) belong to the outer one.
 pub struct PipRepo {
     /// Normalized distribution names, indexed by ComponentId.
     components: IndexSet<String>,
@@ -65,19 +68,30 @@ impl PipRepo {
         let mut path_to_components: HashMap<Utf8PathBuf, Vec<ComponentId>> = HashMap::new();
         let mut canonicalization_cache = HashMap::new();
         let mut n_dists = 0usize;
+        let mut n_vendored = 0usize;
 
-        for (record_path, file_info) in files {
-            if file_info.file_type != FileType::File {
+        // site-packages (or equivalent) is the parent of the dist-info dir
+        // and RECORD entries are relative to it.
+        let mut dist_infos: Vec<(&Utf8Path, &Utf8Path, String)> = files
+            .iter()
+            .filter(|(_, file_info)| file_info.file_type == FileType::File)
+            .filter_map(|(path, _)| {
+                let (dist_info_dir, name) = parse_record_path(path)?;
+                Some((path.as_path(), dist_info_dir.parent()?, name))
+            })
+            .collect();
+
+        // Process outermost first, so that a distribution vendored inside
+        // another one (its RECORD is listed in the outer RECORD) is already
+        // claimed by the time we get to it and can be skipped.
+        dist_infos.sort_by_key(|(_, site_packages, _)| site_packages.components().count());
+
+        for (record_path, site_packages, name) in dist_infos {
+            if path_to_components.contains_key(record_path) {
+                tracing::trace!(path = %record_path, "skipping vendored dist-info");
+                n_vendored += 1;
                 continue;
             }
-            let Some((dist_info_dir, name)) = parse_record_path(record_path) else {
-                continue;
-            };
-            // site-packages (or equivalent) is the parent of the dist-info dir
-            // and RECORD entries are relative to it
-            let Some(site_packages) = dist_info_dir.parent() else {
-                continue;
-            };
 
             let record = match read_record(rootfs, record_path) {
                 Ok(record) => record,
@@ -153,6 +167,7 @@ impl PipRepo {
 
         tracing::debug!(
             dists = n_dists,
+            vendored = n_vendored,
             components = components.len(),
             paths = path_to_components.len(),
             orphan_pyc = n_pyc,
@@ -422,6 +437,33 @@ mod tests {
         let info = repo.component_info(ComponentId(0));
         assert_eq!(info.mtime_clamp, 42);
         assert!(info.stability > 0.0 && info.stability < 1.0);
+    }
+
+    #[test]
+    fn test_load_vendored_dist_info_belongs_to_outer() {
+        let (_tmp, rootfs, files) = setup_rootfs(|rootfs| {
+            write(rootfs, "site-packages/outer/_vendor/inner/mod.py", "");
+            write(
+                rootfs,
+                "site-packages/outer/_vendor/inner-1.dist-info/RECORD",
+                "inner/mod.py,,\ninner-1.dist-info/RECORD,,\n",
+            );
+            write(
+                rootfs,
+                "site-packages/outer-1.dist-info/RECORD",
+                "outer/_vendor/inner/mod.py,,\n\
+                 outer/_vendor/inner-1.dist-info/RECORD,,\n\
+                 outer-1.dist-info/RECORD,,\n",
+            );
+        });
+        let repo = PipRepo::load(&rootfs, &files, 0).unwrap().unwrap();
+        assert_eq!(repo.components.len(), 1);
+        assert_claims(
+            &repo,
+            &files,
+            "/site-packages/outer/_vendor/inner/mod.py",
+            &["outer"],
+        );
     }
 
     #[test]
